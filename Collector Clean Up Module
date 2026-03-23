@@ -1,0 +1,200 @@
+--[=[
+	Made by @the_manga.
+	Last Updated: 24th of March 2026
+]=]
+
+export type Collector<T> = {	
+	Collect: (self: Collector<T>, object: T, cleanup: string?, extra: {index: any?, group: any?}) -> (),
+	Remove: (self: Collector<T>, index: string) -> (),
+	CleanUp: (self: Collector<T>, group: string?) -> (),
+	Destroy: (self: Collector<T>) -> (),
+}
+
+type Object = Instance | thread | RBXScriptConnection | () -> any
+type CollectedObject<T, U> = {
+	object: T,
+	cleanup: U,
+	group: string?,
+	index: any
+}
+
+local NOT_FOUND_ERROR = "%s not found in the objects, please provide valid index to remove"
+local GROUP_NULL = "Group \"%s\" does not exist. Verify the group name is correct and has been properly configured."
+
+local COLLECTOR_IS_DESTROYING = "Collector is destroying, We cannot add any object to this Collector anymore"
+local METHOD_NOT_EXIST = "%s method doesn't exist as Private.CleanUp method, Please try to input valid Private.cleanUp method"
+local INVALID_METHOD = "You need %s type for Private.cleanUp method of this object, But you're providing %s"
+local INVALID_OBJECT = "The provided object is %s, Please provide an valid object"
+
+local DEFAULT_METHODS = {
+	["Instance"] = "Destroy",
+	["RBXScriptSignal"] = "Disconnect",
+	["RBXScriptConnection"] = "Disconnect",	
+}
+
+local LEVEL_TO_OUTPUT = {
+	[1] = print,
+	[2] = warn,
+	[3] = error
+}
+
+local Collector = {}
+local Private = {}
+
+function Private.tell(logString: any, level: number, ...)
+	local outputMethod = LEVEL_TO_OUTPUT[level] :: (string) -> ()
+	local formatString = string.format(logString, ...)
+	
+	return debug.traceback(outputMethod(formatString), level, ...)
+end
+
+function Private.swoosh(collected: CollectedObject<Object, (Object) -> ()>)
+	local cleanup = collected.cleanup
+	if cleanup then
+		cleanup(collected.object)
+		return
+	end
+
+    local object = collected.object
+    local objectType = typeof(object)	
+    
+    if objectType == "Instance" then
+        local destroyMethod = (object :: Instance).Destroy
+        if destroyMethod then
+            destroyMethod((object) :: Instance)
+        end
+    elseif objectType == "RBXScriptConnection" then
+        if not (object :: RBXScriptConnection).Connected then
+            return
+        end
+
+        local disconnect = (object :: RBXScriptConnection).Disconnect
+        if disconnect then
+            disconnect((object :: RBXScriptConnection))
+        end
+    elseif objectType == "function" then
+        object()
+    elseif objectType == "thread" then
+        local status = coroutine.status((object :: thread))
+        if status == "dead" then
+            return
+        end
+
+        task.cancel((object :: thread))
+    end
+end
+
+function Collector.new<T>(): Collector<T>
+	local self = {}
+
+	self._Groups = {
+		["Default"] = {}
+	}
+	
+	self._AssignedObjects = {}
+
+	self.Collect = Private.Add
+	self.Remove = Private.Remove
+	self.CleanUp = Private.CleanUp
+	self.Destroy = Private.Destroy
+
+	return self :: Collector<T>
+end
+
+function Private:Add<T>(object: T, cleanupMethod: string?, index: string?, group: string?)
+	if not object then
+		Private.tell(INVALID_OBJECT, 3, typeof(object))
+		return
+	end
+
+	if self._IsDestroying then
+		Private.tell(COLLECTOR_IS_DESTROYING, 3)
+		return
+	end
+
+	local cleanupFunction
+
+	if typeof(object) == "thread" or typeof(object) == "function" then
+		if not cleanupMethod then
+			Private.tell(INVALID_METHOD, 2, "boolean", typeof(cleanupMethod))
+			return
+		end
+
+		if cleanupMethod and typeof(cleanupMethod) ~= "boolean" then
+			Private.tell(INVALID_METHOD, 2, "boolean", cleanupMethod)
+			return
+		end
+	else
+		if cleanupMethod then
+			local c = (object :: {[string]: any})[cleanupMethod] :: (self: Instance) -> ()
+
+			if not c or typeof(c) ~= "function" then
+				Private.tell(METHOD_NOT_EXIST, 2, cleanupMethod)
+				return
+			end
+
+			cleanupFunction = c
+		end
+	end
+
+	local objectIndex = index or #self._AssignedObjects + 1
+	local objectGroup = group or "Default"
+	
+	local collectedTable = {
+		index = objectIndex,
+		object = object,
+		cleanup = cleanupFunction,
+		group = objectGroup,
+	}
+	
+	self._AssignedObjects[objectIndex] = collectedTable
+	
+	if not objectGroup then return end
+	
+	local ourGroup: {[any]: any} = self._Groups[objectGroup] or {}	
+	table.insert(ourGroup, collectedTable)
+	
+	self._Groups[objectGroup] = ourGroup
+end
+
+function Private:Remove(index: string)
+	if not self._AssignedObjects[index] then
+		Private.tell(NOT_FOUND_ERROR, 2, index)
+		return
+	end
+
+	Private.swoosh(self._AssignedObjects[index])
+	self._AssignedObjects[index] = nil
+end
+
+function Private:CleanUp(group: string?)
+	local toCleanup = nil
+	if group then
+		if not self._Groups[group] then
+			Private.tell(GROUP_NULL, 2, group)
+			return
+		end
+		
+		toCleanup = self._Groups[group]
+		self._Groups[group] = nil
+	else
+		toCleanup = table.clone(self._AssignedObjects)
+		table.clear((self._AssignedObjects :: {[any]: Object}))
+	end	
+	
+	for _, object in toCleanup do
+		Private.swoosh(object)
+		
+		if self._AssignedObjects[object.index] then
+			self._AssignedObjects[object.index] = nil
+		end
+	end
+end
+
+function Private:Destroy()
+	self:CleanUp()
+	table.clear(self)
+	--clears table
+end
+
+return table.freeze(Collector)
