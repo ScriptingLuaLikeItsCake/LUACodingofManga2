@@ -1,0 +1,737 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Modules = {
+	DataManager = require(ServerScriptService.ProfileService.MainData.DataManager),
+	Utility = require(ServerScriptService.Server.BasesServer.Util),
+	BrainrotsData = require(ReplicatedStorage.Modules.BrainrotsData),
+	MutationsData = require(ReplicatedStorage.Modules.MutationsData),
+	NumberConverter = require(ReplicatedStorage.Modules.NumberConverter),
+	Monetization = require(ReplicatedStorage.Modules.Monetization),
+}
+
+local Assets = ReplicatedStorage.Assets
+local Remotes = ReplicatedStorage.Remotes
+
+local Brainrot = {}
+Brainrot.__index = Brainrot
+
+local CharacterModels = {}
+do
+	for _, v in Assets.Models:GetDescendants() do
+		if v:FindFirstChild("Humanoid") then
+			CharacterModels[v.Name] = v
+		end
+	end
+end
+
+local RankColors = {
+	["E Rank"] = Color3.fromRGB(155,155,0),
+	["D Rank"] = Color3.fromRGB(50,200,0),
+	["C Rank"] = Color3.fromRGB(155,155,155),
+	["B Rank"] = Color3.fromRGB(0,0,155),
+	["A Rank"] = Color3.fromRGB(255,255,0),
+	["S Rank"] = Color3.fromRGB(200,0,0),
+	["Monarch"] = Color3.fromRGB(0,0,0),
+}
+
+local MutationTitles = {
+	Normal = Color3.fromRGB(160,160,160),
+	Ice = Color3.fromRGB(0,160,160),
+	Blaze = Color3.fromRGB(160,25,0),
+	Divine = Color3.fromRGB(225,255,0),
+	Cursed = Color3.fromRGB(0,0,0),
+}
+
+function Brainrot.new(player, base, slotNum, info)
+	local self = setmetatable({}, Brainrot)
+
+	self.Player = player
+	self.Base = base
+	self.SlotNum = slotNum
+	self.Info = info
+
+	self.Total = 0
+	self.Active = true
+	self.Stolen = false
+	self.Carried = false
+
+	self.Connections = {}
+	self.SlotConnections = {}
+
+	self:Spawn()
+	self:SetupInteractions()
+	self:StartIncome()
+
+	return self
+end
+
+function Brainrot:Spawn()
+	local template = self.Base.BrainrotModels[self.Info.Name]
+	local slot = self.Base.Slots:FindFirstChild(self.SlotNum)
+	if not template or not slot then return end
+
+	self.Slot = slot
+	self.Model = template:Clone()
+	self.Model.PrimaryPart.Anchored = false
+
+	for _, v in self.Model:GetDescendants() do
+		if v:IsA("BasePart") then
+			v.CollisionGroup = "Brainrot"
+		end
+	end
+
+	for name in self.Base.Profile.BrainrotsData[self.SlotNum].Mutations do
+		local mutation = Modules.MutationsData[name]
+		if mutation and mutation.AuraModel then
+			local aura = mutation.AuraModel:Clone()
+			for _, obj in aura:GetDescendants() do
+				if obj:IsA("ParticleEmitter") then
+					local part = self.Model:FindFirstChild(obj.Parent.Name)
+					if part then
+						obj:Clone().Parent = part
+					end
+				end
+			end
+			aura:Destroy()
+		end
+	end
+
+	if self.Model:FindFirstChild("Animations") then
+		local animate = script.Parent.Animate:Clone()
+		animate.Parent = self.Model
+		animate.Disabled = false
+		animate.idle.Animation1.AnimationId = self.Model.Animations.Idle.AnimationId
+		animate.idle.Animation2.AnimationId = self.Model.Animations.Idle.AnimationId
+		animate.walk.WalkAnim.AnimationId = self.Model.Animations.Walk.AnimationId
+	end
+
+	local mutationsString = ""
+	local mutationMulti = 1
+
+	for mutation in self.Base.Profile.BrainrotsData[self.SlotNum].Mutations do
+		local data = Modules.MutationsData[mutation]
+		if not data then continue end
+
+		mutationsString = mutationsString == "" and mutation or (mutationsString .. ", " .. mutation)
+		mutationMulti += data.CashMulti
+	end
+
+	if mutationsString == "" then
+		mutationsString = "Normal"
+	end
+
+	local rank = CharacterModels[template.Name].Parent.Name
+	if RankColors[rank] then
+		local ui = Assets.Overhead:Clone()
+		ui.NameLabel.Text = self.Info.Name
+		ui.CostLabel.Text = Modules.NumberConverter.Convert(Modules.BrainrotsData[self.Info.Name].BuyPrice) .. "$"
+		ui.MoneyLabel.Text = Modules.NumberConverter.Convert(Modules.BrainrotsData[self.Info.Name].MoneyPS * mutationMulti) .. "/s"
+		ui.TierLabel.Text = rank
+		ui.TierLabel.TextColor3 = RankColors[rank]
+		ui.MutationLabel.Text = mutationsString
+		ui.MutationLabel.TextColor3 = MutationTitles[mutationsString] or Color3.fromRGB(80,0,50)
+		ui.Parent = self.Model
+	end
+
+	local height = self.Model:GetExtentsSize().Y / 1.8
+	self.Model:PivotTo((self.Slot.Model.Platform.CFrame * CFrame.Angles(0,0,math.rad(-90))) + Vector3.new(0,height,0))
+	self.Model.Parent = self.Slot
+	self.Model.PrimaryPart:SetNetworkOwner(nil)
+
+	self:RefreshPrompts()
+end
+
+function Brainrot:RefreshPrompts()
+	if not self.Slot or not self.Model then return end
+
+	local sell = self.Slot.Sell.SellPrompt
+	local carry = self.Slot.PickUp.PickUpPrompt
+	local steal = self.Model.PrimaryPart:FindFirstChild("stealPrompt")
+
+	task.delay(2, function()
+		Remotes.PromptDisable:FireClient(self.Player, sell, true)
+		Remotes.PromptDisable:FireClient(self.Player, carry, true)
+		if steal then
+			Remotes.PromptDisable:FireClient(self.Player, steal, false)
+		end
+	end)
+end
+
+function Brainrot:SetupInteractions()
+	local sell = self.Slot.Sell.SellPrompt
+	local carry = self.Slot.PickUp.PickUpPrompt
+	local playerData = self.Player:WaitForChild("PlayerData")
+
+	carry.Enabled = false
+	sell.Enabled = false
+
+	local steal = Instance.new("ProximityPrompt")
+	steal.Name = "stealPrompt"
+	steal.ObjectText = "Steal"
+	steal.HoldDuration = 0.5
+	steal.RequiresLineOfSight = false
+	steal.Parent = self.Model.PrimaryPart
+
+	self:RefreshPrompts()
+
+	local data = Modules.BrainrotsData[self.Info.Name]
+	if data and self.Base.Profile.LastJoined > 0 then
+		local amount = data.MoneyPS * (os.time() - self.Base.Profile.LastJoined)
+		self.Total += amount + self.Base.Profile.BrainrotsData[self.SlotNum].OfflineEarnings
+		self.Base.Profile.BrainrotsData[self.SlotNum].OfflineEarnings = self.Total
+	end
+
+	self.Connections.Respawn = self.Player.CharacterAdded:Connect(function()
+		task.delay(0.5, function()
+			self:RefreshPrompts()
+		end)
+	end)
+
+	self.Connections.Steal = steal.Triggered:Connect(function(plr)
+		if plr == self.Player or plr:GetAttribute("Carrying") or self.Carried or self.Stolen then return end
+
+		local inventoryData = plr:WaitForChild("InventoryData")
+		if not inventoryData then return end
+
+		if inventoryData.Other.StealKey.Value < 1 then
+			Remotes.Notify:FireClient(plr, "You don't have enough steal keys!", Color3.fromRGB(255,0,0), Color3.fromRGB(155,25,0), Assets.Sounds.error)
+			return
+		end
+
+		local profile = Modules.DataManager.getProfileData(plr)
+		if not profile then return end
+
+		local slot
+		for i, v in profile.BrainrotsData do
+			if i > plr.BaseData.Slots.Value then break end
+			if not v.Owned then
+				slot = i
+				break
+			end
+		end
+
+		if not slot then
+			Remotes.Notify:FireClient(plr, "Your base is full!", Color3.fromRGB(255,0,0), Color3.fromRGB(155,25,0), Assets.Sounds.error)
+			return
+		end
+
+		local humanoid = plr.Character and plr.Character:FindFirstChild("Humanoid")
+		if not humanoid or humanoid.Health <= 0 then return end
+
+		Remotes.Notify:FireClient(self.Player, "Someone is stealing from your base!", Color3.fromRGB(255,0,0), Color3.fromRGB(150,0,0))
+		inventoryData.Other.StealKey.Value -= 1
+
+		local animator = humanoid:FindFirstChildOfClass("Animator") or Instance.new("Animator", humanoid)
+		local track = animator:LoadAnimation(script.CarryAnim)
+		track:Play()
+
+		task.spawn(function()
+			task.wait(0.1)
+			while self.Stolen do
+				task.wait(0.1)
+				humanoid:UnequipTools()
+			end
+			track:Stop()
+		end)
+
+		local function reset()
+			pcall(function()
+				self.Stolen = false
+				plr:SetAttribute("Carrying", nil)
+
+				self.Model.HumanoidRootPart.Anchored = false
+				self.Model.Humanoid.PlatformStand = false
+
+				for _, v in self.Model:GetDescendants() do
+					if v:IsA("BasePart") then
+						v.Massless = false
+						v.CanCollide = true
+						v.CollisionGroup = "Brainrot"
+					end
+				end
+
+				if plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
+					for _, obj in plr.Character.HumanoidRootPart:GetChildren() do
+						if obj:IsA("Weld") then
+							obj:Destroy()
+						end
+					end
+				end
+
+				pcall(function()
+					self.Model.PrimaryPart:SetNetworkOwner(nil)
+				end)
+
+				task.delay(0.25, function()
+					local height = self.Model:GetExtentsSize().Y / 1.8
+					self.Model:PivotTo((self.Slot.Model.Platform.CFrame * CFrame.Angles(0,0,math.rad(-90))) + Vector3.new(0,height,0))
+					self.Model.Parent = self.Slot
+				end)
+
+				for _, key in { "Stolen", "Died", "Hit", "Left" } do
+					if self.Connections[key] then
+						self.Connections[key]:Disconnect()
+						self.Connections[key] = nil
+					end
+				end
+			end)
+		end
+
+		local function stolen()
+			self.Base.Profile.BrainrotsData[self.SlotNum] = {
+				Owned = false,
+				Name = nil,
+				OfflineEarnings = 0,
+				Mutations = {}
+			}
+
+			if plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
+				for _, obj in plr.Character.HumanoidRootPart:GetChildren() do
+					if obj:IsA("Weld") then
+						obj:Destroy()
+					end
+				end
+			end
+
+			self.Stolen = false
+			plr:SetAttribute("Carrying", nil)
+
+			local slotData = profile.BrainrotsData[slot]
+			slotData.Owned = true
+			slotData.Name = self.Model.Name
+			slotData.Mutations = self.Base.Profile.BrainrotsData[self.SlotNum].Mutations
+			slotData.OfflineEarnings = 0
+
+			local base = Modules.Utility.GetBase(plr)
+			if base and Modules.BrainrotsData[slotData.Name] then
+				base:CreateBrainrot(slot, {
+					Name = slotData.Name,
+					Mutations = slotData.Mutations
+				})
+			end
+
+			Remotes.Notify:FireClient(plr, "You successfully stole " .. self.Player.Name .. "'s Anime Character", Color3.fromRGB(0,255,0), Color3.fromRGB(0,200,0), Assets.Sounds.cash)
+
+			self:Destroy()
+		end
+
+		self.Connections.Hit = humanoid:GetPropertyChangedSignal("Sit"):Connect(reset)
+		self.Connections.Died = humanoid.Died:Connect(reset)
+
+		self.Connections.Left = Players.PlayerRemoving:Connect(function(who)
+			if who == self.Player then
+				stolen()
+			elseif who == plr then
+				reset()
+			end
+		end)
+
+		self.Stolen = true
+		plr:SetAttribute("Carrying", true)
+
+		self.Model.HumanoidRootPart.Anchored = false
+		self.Model.Humanoid.PlatformStand = true
+
+		for _, v in self.Model:GetDescendants() do
+			if v:IsA("BasePart") then
+				v.Massless = true
+				v.Anchored = false
+				v.CanCollide = false
+				v.CollisionGroup = "NoCollide"
+			end
+		end
+
+		self.Model.HumanoidRootPart.CFrame = (plr.Character.PrimaryPart.CFrame * CFrame.Angles(0,math.rad(180),0)) + Vector3.new(-3,0,0)
+
+		local weld = Instance.new("Weld")
+		weld.Part0 = plr.Character.HumanoidRootPart
+		weld.Part1 = self.Model.PrimaryPart
+		weld.C0 = CFrame.new(0,0,-2.5) * CFrame.Angles(0,math.rad(180),0)
+		weld.Parent = plr.Character.HumanoidRootPart
+
+		local baseModel = workspace.Bases:FindFirstChild(plr:GetAttribute("Base"))
+		self.Connections.Stolen = baseModel.BaseEntrance.Touched:Connect(function(hit)
+			if hit.Parent == plr.Character then
+				stolen()
+			end
+		end)
+	end)
+
+	self.Connections.Rebirthed = playerData.Rebirths.Changed:Connect(function()
+		self.Total = 0
+		self.Slot.Claim.ClaimUI.ClaimAmount.Text = Modules.NumberConverter.Convert(self.Total) .. "$"
+	end)
+
+	self:BindSlotConnections()
+end
+
+function Brainrot:BindSlotConnections()
+	for _, c in self.SlotConnections do
+		if c then c:Disconnect() end
+	end
+	self.SlotConnections = {}
+
+	local sell = self.Slot.Sell.SellPrompt
+	local carry = self.Slot.PickUp.PickUpPrompt
+
+	self.SlotConnections.Remove = sell.Triggered:Connect(function(plr)
+		if plr ~= self.Player or self.Stolen or plr:GetAttribute("Carrying") then return end
+
+		local count = 0
+		for _, v in self.Base.Profile.BrainrotsData do
+			if v.Owned then count += 1 end
+		end
+
+		if count <= 1 then
+			Remotes.Notify:FireClient(self.Player, "Can't sell your last anime character!", Color3.fromRGB(255,0,0), Color3.fromRGB(155,25,0), Assets.Sounds.error)
+			return
+		end
+
+		local data = Modules.BrainrotsData[self.Info.Name]
+		local pd = self.Player.PlayerData
+		local bp = self.Player.BattlepassData
+
+		pd.Gems.Value += data.GemPrice
+		pd.Cash.Value += data.SellPrice
+		bp.XP.Value += data.XP
+
+		sell.Enabled = false
+		carry.Enabled = false
+
+		self.Base.Profile.BrainrotsData[self.SlotNum] = {
+			Owned = false,
+			Name = nil,
+			OfflineEarnings = 0,
+			Mutations = {}
+		}
+
+		self:Destroy()
+	end)
+
+	self.SlotConnections.PickUp = carry.Triggered:Connect(function(plr)
+		if plr ~= self.Player or self.Stolen then return end
+
+		local carrying = plr:GetAttribute("Carrying")
+		if carrying then
+			local other = self.Base.Brainrots[carrying]
+			if not other then
+				self.Carried = false
+				plr:SetAttribute("Carrying", nil)
+				return
+			end
+
+			for _, v in other.Model:GetDescendants() do
+				if v:IsA("BasePart") then
+					v.Massless = false
+					v.CanCollide = true
+					v.CollisionGroup = "Brainrot"
+				end
+			end
+
+			if plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
+				for _, obj in plr.Character.HumanoidRootPart:GetChildren() do
+					if obj:IsA("Weld") then
+						obj:Destroy()
+					end
+				end
+			end
+
+			for _, slot in self.Base.Slots:GetChildren() do
+				local id = tonumber(slot.Name)
+				if self.Base.Profile.BrainrotsData[id].Owned then
+					Remotes.PromptDisable:FireClient(self.Player, slot.PickUp.PickUpPrompt, true)
+					Remotes.PromptDisable:FireClient(self.Player, slot.Sell.SellPrompt, true)
+					continue
+				end
+
+				Remotes.PromptDisable:FireClient(self.Player, slot.PickUp.PickUpPrompt, false)
+				Remotes.PromptDisable:FireClient(self.Player, slot.Sell.SellPrompt, false)
+			end
+
+			for _, key in { "HitC", "DiedC" } do
+				if self.Connections[key] then
+					self.Connections[key]:Disconnect()
+					self.Connections[key] = nil
+				end
+			end
+
+			if self.Connections.EmptySlot then
+				for _, c in self.Connections.EmptySlot do
+					c:Disconnect()
+				end
+				self.Connections.EmptySlot = nil
+			end
+
+			other.Model.Humanoid.PlatformStand = false
+			task.wait(0.05)
+
+			plr:SetAttribute("Carrying", nil)
+			self.Carried = false
+
+			local oldSlot, oldNum = self.Slot, self.SlotNum
+			local otherSlot, otherNum = other.Slot, other.SlotNum
+
+			local temp = self.Base.Profile.BrainrotsData[oldNum]
+			self.Base.Profile.BrainrotsData[oldNum] = self.Base.Profile.BrainrotsData[otherNum]
+			self.Base.Profile.BrainrotsData[otherNum] = temp
+
+			oldSlot.Claim.ClaimUI.ClaimAmount.Text = "0$"
+
+			self.Total = 0
+			self.Slot, self.SlotNum = otherSlot, otherNum
+			self.Model.Parent = otherSlot
+
+			other.Slot, other.SlotNum = oldSlot, oldNum
+			other.Model.Parent = oldSlot
+
+			self.Base.Brainrots[self.SlotNum] = self
+			self.Base.Brainrots[other.SlotNum] = other
+
+			local function move(b)
+				local h = b.Model:GetExtentsSize().Y / 1.8
+				b.Model:PivotTo((b.Slot.Model.Platform.CFrame * CFrame.Angles(0,0,math.rad(-90))) + Vector3.new(0,h,0))
+				b.Model.Parent = b.Slot
+			end
+
+			move(self)
+			move(other)
+
+			self:BindSlotConnections()
+			other:BindSlotConnections()
+			self:RefreshPrompts()
+			return
+		end
+
+		local humanoid = plr.Character and plr.Character:FindFirstChild("Humanoid")
+		if not humanoid then return end
+
+		plr:SetAttribute("Carrying", self.SlotNum)
+
+		local animator = humanoid:FindFirstChildOfClass("Animator") or Instance.new("Animator", humanoid)
+		local track = animator:LoadAnimation(script.CarryAnim)
+		track:Play()
+
+		task.spawn(function()
+			task.wait(0.1)
+			local slotRef = self.Slot
+			while self.Carried and self.Model.Parent == slotRef do
+				task.wait(0.1)
+				humanoid:UnequipTools()
+			end
+			track:Stop()
+		end)
+
+		local function reset()
+			pcall(function()
+				plr:SetAttribute("Carrying", nil)
+				self.Carried = false
+
+				self.Model.HumanoidRootPart.Anchored = false
+				self.Model.Humanoid.PlatformStand = false
+
+				for _, v in self.Model:GetDescendants() do
+					if v:IsA("BasePart") then
+						v.Massless = false
+						v.CanCollide = true
+						v.CollisionGroup = "Brainrot"
+					end
+				end
+
+				if plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
+					for _, obj in plr.Character.HumanoidRootPart:GetChildren() do
+						if obj:IsA("Weld") then
+							obj:Destroy()
+						end
+					end
+				end
+
+				task.delay(0.25, function()
+					local h = self.Model:GetExtentsSize().Y / 1.8
+					self.Model:PivotTo((self.Slot.Model.Platform.CFrame * CFrame.Angles(0,0,math.rad(-90))) + Vector3.new(0,h,0))
+					self.Model.Parent = self.Slot
+					pcall(function()
+						self.Model.PrimaryPart:SetNetworkOwner(nil)
+					end)
+				end)
+
+				if self.Connections.DiedC then self.Connections.DiedC:Disconnect() end
+				if self.Connections.HitC then self.Connections.HitC:Disconnect() end
+				self.Connections.DiedC = nil
+				self.Connections.HitC = nil
+			end)
+		end
+
+		self.Connections.HitC = humanoid:GetPropertyChangedSignal("Sit"):Connect(reset)
+		self.Connections.DiedC = humanoid.Died:Connect(reset)
+
+		self.Carried = true
+		self.Model.HumanoidRootPart.Anchored = false
+		self.Model.Humanoid.PlatformStand = true
+
+		for _, v in self.Model:GetDescendants() do
+			if v:IsA("BasePart") then
+				v.Massless = true
+				v.Anchored = false
+				v.CanCollide = false
+				v.CollisionGroup = "NoCollide"
+			end
+		end
+
+		if not self.Connections.EmptySlot then
+			self.Connections.EmptySlot = {}
+		end
+
+		for _, c in self.Connections.EmptySlot do
+			c:Disconnect()
+		end
+
+		for _, slot in self.Base.Slots:GetChildren() do
+			Remotes.PromptDisable:FireClient(self.Player, slot.PickUp.PickUpPrompt, true)
+
+			local id = tonumber(slot.Name)
+			if not id or self.Base.Profile.BrainrotsData[id].Owned then continue end
+
+			self.Connections.EmptySlot[id] = slot.PickUp.PickUpPrompt.Triggered:Connect(function(plr)
+				if plr ~= self.Player or not plr:GetAttribute("Carrying") then return end
+				if self.Base.Profile.BrainrotsData[id].Owned then return end
+
+				plr:SetAttribute("Carrying", nil)
+				self.Model.Humanoid.PlatformStand = false
+				self.Carried = false
+
+				for _, v in self.Model:GetDescendants() do
+					if v:IsA("BasePart") then
+						v.Massless = false
+						v.CanCollide = true
+						v.CollisionGroup = "Brainrot"
+					end
+				end
+
+				if plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
+					for _, obj in plr.Character.HumanoidRootPart:GetChildren() do
+						if obj:IsA("Weld") then
+							obj:Destroy()
+						end
+					end
+				end
+
+				self.Base.Profile.BrainrotsData[id].Owned = true
+				self.Base.Profile.BrainrotsData[id].Name = self.Info.Name
+				self.Base.Profile.BrainrotsData[id].Mutations = self.Base.Profile.BrainrotsData[self.SlotNum].Mutations
+
+				self.Base.Profile.BrainrotsData[self.SlotNum] = {
+					Owned = false,
+					Name = nil,
+					OfflineEarnings = 0,
+					Mutations = {}
+				}
+
+				self.Slot.Claim.ClaimUI.ClaimAmount.Text = "0$"
+				self.Base.Brainrots[self.SlotNum] = nil
+
+				self.Total = 0
+				self.Slot = slot
+				self.SlotNum = id
+				self.Base.Brainrots[self.SlotNum] = self
+
+				for _, s in self.Base.Slots:GetChildren() do
+					local sid = tonumber(s.Name)
+					if self.Base.Profile.BrainrotsData[sid].Owned then
+						Remotes.PromptDisable:FireClient(self.Player, s.PickUp.PickUpPrompt, true)
+						Remotes.PromptDisable:FireClient(self.Player, s.Sell.SellPrompt, true)
+						continue
+					end
+
+					Remotes.PromptDisable:FireClient(self.Player, s.PickUp.PickUpPrompt, false)
+					Remotes.PromptDisable:FireClient(self.Player, s.Sell.SellPrompt, false)
+				end
+
+				local h = self.Model:GetExtentsSize().Y / 1.8
+				self.Model:PivotTo((slot.Model.Platform.CFrame * CFrame.Angles(0,0,math.rad(-90))) + Vector3.new(0,h,0))
+				self.Model.Parent = slot
+
+				for _, c in self.Connections.EmptySlot do
+					c:Disconnect()
+				end
+				self.Connections.EmptySlot = nil
+
+				self:BindSlotConnections()
+			end)
+		end
+
+		self.Model.HumanoidRootPart.CFrame = (self.Player.Character.PrimaryPart.CFrame * CFrame.Angles(0,math.rad(180),0)) + Vector3.new(-3,0,0)
+
+		local weld = Instance.new("Weld")
+		weld.Part0 = plr.Character.HumanoidRootPart
+		weld.Part1 = self.Model.PrimaryPart
+		weld.C0 = CFrame.new(0,0,-2.5) * CFrame.Angles(0,math.rad(180),0)
+		weld.Parent = plr.Character.HumanoidRootPart
+	end)
+
+	self.SlotConnections.Claim = self.Slot.Claim.Touched:Connect(function(hit)
+		if self.Stolen then return end
+		if hit.Parent == self.Player.Character then
+			self.Player.PlayerData.Cash.Value += self.Total
+			self.Total = 0
+			self.Base.Profile.BrainrotsData[self.SlotNum].OfflineEarnings = 0
+			self.Slot.Claim.ClaimUI.ClaimAmount.Text = Modules.NumberConverter.Convert(self.Total) .. "$"
+		end
+	end)
+end
+
+function Brainrot:StartIncome()
+	task.spawn(function()
+		local mutationMulti = 0
+		for mutation in self.Base.Profile.BrainrotsData[self.SlotNum].Mutations do
+			local data = Modules.MutationsData[mutation]
+			if data then
+				mutationMulti += data.CashMulti
+			end
+		end
+
+		local owned = self.Player.GamepassesOwned["2x Multi"].Value
+		local multi = owned and 2 or 1
+
+		while self.Active do
+			task.wait(1)
+			local data = Modules.BrainrotsData[self.Info.Name]
+			if data then
+				self.Total += (data.MoneyPS * (self.Player.PlayerData.CashMulti.Value + mutationMulti)) * multi
+				self.Slot.Claim.ClaimUI.ClaimAmount.Text = Modules.NumberConverter.Convert(self.Total) .. "$"
+			end
+		end
+
+		self.Slot.Claim.ClaimUI.ClaimAmount.Text = "0$"
+	end)
+end
+
+function Brainrot:Destroy()
+	if not self.Active then return end
+	self.Active = false
+
+	if self.Model then
+		self.Model:Destroy()
+	end
+
+	if self.Base.Profile.BrainrotsData[self.SlotNum].Owned then
+		self.Base.Profile.BrainrotsData[self.SlotNum].OfflineEarnings += (self.Total - self.Base.Profile.BrainrotsData[self.SlotNum].OfflineEarnings)
+	end
+
+	for _, c in self.Connections do
+		if typeof(c) == "RBXScriptConnection" then
+			c:Disconnect()
+		end
+	end
+
+	for _, c in self.SlotConnections do
+		if typeof(c) == "RBXScriptConnection" then
+			c:Disconnect()
+		end
+	end
+
+	self.Base.Brainrots[self.SlotNum] = nil
+end
+
+return Brainrot
