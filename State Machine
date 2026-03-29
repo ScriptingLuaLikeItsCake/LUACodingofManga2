@@ -1,0 +1,320 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+
+local Modules = {
+	DataManager = require(ServerScriptService.ProfileService.MainData.DataManager),
+	BaseManager = require(ServerScriptService.Server.BasesServer.BaseManager),
+	BrainrotsData = require(ReplicatedStorage.Modules.BrainrotsData),
+	MutationsData = require(ReplicatedStorage.Modules.MutationsData),
+	SimplePath = require(ReplicatedStorage.Modules.SimplePath),
+}
+
+local Assets = ReplicatedStorage.Assets
+local Remotes = ReplicatedStorage.Remotes
+
+local Brainrot = {}
+Brainrot.__index = Brainrot
+Brainrot.Speed = 10
+
+local ValidTransitions = {
+	Idle = { MovingToBase = true, Destroyed = true },
+	MovingToBase = { Idle = true, Stolen = true, Owned = true, Destroyed = true },
+	Stolen = { MovingToBase = true, Destroyed = true },
+	Owned = { Destroyed = true },
+}
+
+local CharacterModels = {}
+for _, v in Assets.Models:GetDescendants() do
+	if v:FindFirstChild("Humanoid") then
+		CharacterModels[v.Name] = v
+	end
+end
+
+function Brainrot.new(model)
+	local self = setmetatable({}, Brainrot)
+	self.Model = model
+	self.Prompt = model:FindFirstChildOfClass("ProximityPrompt")
+	self.Path = Modules.SimplePath.new(model)
+	self.State = "Idle"
+	self.Owner = nil
+	self.Slot = nil
+	self.LeaveConn = nil
+	self:Move()
+	return self
+end
+
+function Brainrot:CanTransition(state)
+	local current = ValidTransitions[self.State]
+	return current and current[state]
+end
+
+function Brainrot:SetState(state)
+	if not self:CanTransition(state) then return end
+	self.State = state
+end
+
+function Brainrot:Move()
+	task.spawn(function()
+		local map = Workspace:FindFirstChild("Map")
+		local portals = Workspace:FindFirstChild("Portals")
+		if not map or not portals then return end
+
+		local waypointsFolder = map:FindFirstChild("Waypoints")
+		local start = portals:FindFirstChild("Start")
+		local finish = portals:FindFirstChild("Finish")
+		if not waypointsFolder or not start or not finish then return end
+
+		local waypoints = waypointsFolder:GetChildren()
+		local humanoid = self.Model:FindFirstChildOfClass("Humanoid")
+		local root = self.Model.PrimaryPart
+		if not humanoid or not root then return end
+
+		root.CFrame = start.End.CFrame
+		humanoid.WalkSpeed = Brainrot.Speed
+
+		table.sort(waypoints, function(a, b)
+			return tonumber(a.Name) < tonumber(b.Name)
+		end)
+
+		for _, point in waypoints do
+			if self.State ~= "Idle" then break end
+			humanoid:MoveTo(point.Position)
+
+			while self.Model.Parent do
+				if (root.Position - point.Position).Magnitude < 5 then
+					local nextPoint = waypoints[tonumber(point.Name + 1)]
+					if nextPoint then
+						humanoid:MoveTo(nextPoint.Position)
+					end
+					break
+				end
+				task.wait(0.1)
+			end
+
+			if self.Model.Parent and (root.Position - finish.End.Position).Magnitude < 4 then
+				self.Model:Destroy()
+			end
+		end
+
+		if self.State == "Idle" then
+			self:Destroy()
+		end
+	end)
+end
+
+function Brainrot:Purchase(player)
+	if player == self.Owner or self.State == "Stolen" or player:GetAttribute("Carrying") then return false end
+
+	local profile = Modules.DataManager.getProfileData(player)
+	if not profile then return false end
+
+	local data = Modules.BrainrotsData[self.Model.Name]
+	if not data then return false end
+
+	local playerData = player:FindFirstChild("PlayerData")
+	if not playerData or playerData.Cash.Value < data.BuyPrice then
+		Remotes.Notify:FireClient(player, "Not enough cash!", Color3.fromRGB(255,0,0), Color3.fromRGB(155,25,0), Assets.Sounds.error)
+		return false
+	end
+
+	local slot
+	for i, v in profile.BrainrotsData do
+		if i > player.BaseData.Slots.Value then break end
+		if not v.Owned then
+			slot = i
+			break
+		end
+	end
+
+	if not slot then
+		Remotes.Notify:FireClient(player, "Your base is full!", Color3.fromRGB(255,0,0), Color3.fromRGB(155,25,0), Assets.Sounds.error)
+		return false
+	end
+
+	playerData.Cash.Value -= data.BuyPrice
+
+	if self.Owner and self.Slot then
+		if self.LeaveConn then
+			self.LeaveConn:Disconnect()
+			self.LeaveConn = nil
+		end
+
+		self:SetState("Stolen")
+
+		local prevProfile = Modules.DataManager.getProfileData(self.Owner)
+		if prevProfile then
+			prevProfile.BrainrotsData[self.Slot] = {
+				Owned = false,
+				Name = nil,
+				OfflineEarnings = 0,
+				Mutations = {}
+			}
+		end
+
+		task.wait(0.5)
+	end
+
+	self.LeaveConn = Players.PlayerRemoving:Connect(function(plr)
+		if plr ~= player and self.State ~= "Owned" then return end
+
+		profile.BrainrotsData[slot] = {
+			Owned = false,
+			Name = nil,
+			OfflineEarnings = 0,
+			Mutations = {}
+		}
+
+		if self.LeaveConn then
+			self.LeaveConn:Disconnect()
+			self.LeaveConn = nil
+		end
+
+		self.Owner = nil
+		self.Slot = nil
+
+		self:SetState("Idle")
+		self:Move()
+	end)
+
+	local slotData = profile.BrainrotsData[slot]
+	slotData.Owned = true
+	slotData.Name = self.Model.Name
+	slotData.Mutations = {}
+	slotData.OfflineEarnings = 0
+
+	self.Owner = player
+	self.Slot = slot
+	self:SetState("MovingToBase")
+	self:MoveToBase(slotData, profile)
+	return true
+end
+
+function Brainrot:MoveToBase(slotData, profile)
+	if not slotData or self.State ~= "MovingToBase" then return end
+
+	task.spawn(function()
+		local bases = Workspace:FindFirstChild("Bases")
+		if not bases then return end
+
+		local baseModel = bases:FindFirstChild(self.Owner:GetAttribute("Base"))
+		if not baseModel then
+			self:Destroy()
+			return
+		end
+
+		local entrance = baseModel:FindFirstChild("BaseEntrance")
+		if not entrance then return end
+
+		local reached = false
+		local owner = self.Owner
+
+		local conn
+		conn = entrance.Touched:Connect(function(hit)
+			if hit:IsDescendantOf(self.Model) then
+				reached = true
+				conn:Disconnect()
+			end
+		end)
+
+		while self.Model.Parent and owner.Parent and self.Owner == owner and self.State ~= "Stolen" and not reached do
+			self.Path:Run(entrance.Position)
+			task.wait(0.5)
+		end
+
+		if not self.Model.Parent or not owner.Parent or self.State == "Stolen" or self.Owner ~= owner then
+			if conn then conn:Disconnect() end
+			return
+		end
+
+		if reached and self.Owner.Parent then
+			self:SetState("Owned")
+			self:EnterBase(baseModel, slotData, profile)
+		else
+			self:Destroy()
+		end
+	end)
+end
+
+function Brainrot:EnterBase(baseModel, slotData, profile)
+	if not baseModel or not slotData or not profile then 
+		return 
+	end
+
+	if self.Prompt then
+		self.Prompt:Destroy()
+	end
+
+	for name in self.Model:GetAttributes() do
+		if Modules.MutationsData[name] then
+			slotData.Mutations[name] = true
+			profile.Index[slotData.Name][name] = true
+			Remotes.IndexClient:FireClient(self.Owner, slotData.Name, name)
+		end
+	end
+
+	local count = 0
+	for _ in slotData.Mutations do
+		count += 1
+	end
+
+	if count <= 0 then
+		profile.Index[slotData.Name].Normal = true
+		Remotes.IndexClient:FireClient(self.Owner, slotData.Name, "Normal")
+	end
+
+	local rank = CharacterModels[slotData.Name].Parent.Name
+	local mutation
+	if #slotData.Mutations == 1 then
+		mutation = slotData.Mutations[1]
+	elseif #slotData.Mutations <= 0 then
+		mutation = "Normal"
+	end
+
+	if profile.SettingsData.AutoSell.Enabled and profile.SettingsData.AutoSell[mutation] and profile.SettingsData.AutoSell[mutation][rank] then
+		local playerData = self.Owner:FindFirstChild("PlayerData")
+		local battlepassData = self.Owner:FindFirstChild("BattlepassData")
+		local data = Modules.BrainrotsData[slotData.Name]
+
+		playerData.Gems.Value += data.GemPrice
+		playerData.Cash.Value += data.SellPrice
+		battlepassData.XP.Value += data.XP
+
+		profile.BrainrotsData[self.Slot] = {
+			Owned = false,
+			Name = nil,
+			OfflineEarnings = 0,
+			Mutations = {}
+		}
+
+		self:Destroy()
+		return
+	end
+
+	local base = Modules.BaseManager:GetBase(self.Owner)
+	if base and Modules.BrainrotsData[self.Model.Name] then
+		base:CreateBrainrot(self.Slot, {Name = slotData.Name, Mutations = slotData.Mutations})
+	end
+
+	if self.LeaveConn then
+		self.LeaveConn:Disconnect()
+		self.LeaveConn = nil
+	end
+
+	self:Destroy()
+end
+
+function Brainrot:Destroy()
+	if self.State == "Destroyed" then 
+		return 
+	end
+	
+	self:SetState("Destroyed")
+
+	if self.Model then
+		self.Model:Destroy()
+	end
+end
+
+return Brainrot
