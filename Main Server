@@ -1,0 +1,495 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Modules = {
+	DataManager = require(ServerScriptService.ProfileService.MainData.DataManager),
+	BaseManager = require(ServerScriptService.Server.BasesServer.BaseManager),
+	RebirthData = require(ReplicatedStorage.Modules.RebirthData),
+	SpinData = require(ReplicatedStorage.Modules.SpinData),
+	CodesData = require(ReplicatedStorage.Modules.CodesData),
+	DailyData = require(ReplicatedStorage.Modules.DailyData),
+	BattlepassData = require(ReplicatedStorage.Modules.BattlepassData),
+	ItemShopData = require(ReplicatedStorage.Modules.ShopData),
+	Randomize = require(ReplicatedStorage.Modules.Randomize),
+	Monetization = require(ReplicatedStorage.Modules.Monetization),
+	NumberConverter = require(ReplicatedStorage.Modules.NumberConverter)
+}
+
+local Remotes = ReplicatedStorage.Remotes
+
+local Events = {
+	Rebirth = Remotes.Rebirth,
+	Spin = Remotes.Spin,
+	Redeem = Remotes.Redeem,
+	Daily = Remotes.DailyStreak,
+	Battlepass = Remotes.ClaimLevel,
+	Shop = Remotes.PurchaseItem,
+	AutoSell = Remotes.AutoSell,
+	Favorite = Remotes.FavoriteEvent
+}
+
+local SpinJoinTimes = {}
+
+local CharacterModels = {}
+for _, v in ReplicatedStorage.Assets.Models:GetDescendants() do
+	if v:FindFirstChild("Humanoid") then
+		CharacterModels[v.Name] = v
+	end
+end
+
+local function getProfile(player)
+	return Modules.DataManager.getProfileData(player)
+end
+
+local function getFreeSlot(player, profile)
+	for slot, data in profile.BrainrotsData do
+		if slot > player.BaseData.Slots.Value then break end
+		if not data.Owned then
+			return slot
+		end
+	end
+end
+
+local function PlayerAdded(player)
+	local playerData = player:WaitForChild("PlayerData")
+	local battlepassData = player:WaitForChild("BattlepassData")
+	local spinCountdown = playerData:WaitForChild("SpinCountdown")
+	local profile = getProfile(player)
+
+	SpinJoinTimes[player.Name] = os.time()
+
+	battlepassData.XP.Changed:Connect(function()
+		local lvl = battlepassData.Level.Value
+		local current = Modules.BattlepassData.NormalRewards[lvl]
+		local next = Modules.BattlepassData.NormalRewards[lvl + 1]
+
+		if next and battlepassData.XP.Value >= current.RequiredXP then
+			battlepassData.XP.Value = 0
+			battlepassData.Level.Value += 1
+		end
+	end)
+
+	task.spawn(function()
+		while player.Parent do
+			task.wait(1)
+			playerData.TimePlayed.Value += 1
+		end
+	end)
+
+	if profile then
+		local now = os.time()
+		local day = 86400
+
+		if profile.Streak == 0 or not profile.LastJoined then
+			profile.Streak = 1
+			profile.LastJoined = now
+		else
+			local diff = now - profile.LastJoined
+			if diff >= day then
+				profile.Streak = profile.Streak < 7 and profile.Streak + 1 or 1
+				profile.LastJoined = now
+			end
+		end
+	end
+
+	task.spawn(function()
+		local function giveSpin()
+			spinCountdown.Value = 0
+			playerData.Spins.Value += 1
+			SpinJoinTimes[player.Name] = os.time()
+
+			task.delay(0.5, function()
+				playerData.SpinCountdown.Value = 1200
+				PlayerAdded(player)
+			end)
+		end
+
+		if spinCountdown.Value > 0 then
+			task.wait(spinCountdown.Value)
+			if Players:FindFirstChild(player.Name) then
+				giveSpin()
+			end
+		else
+			giveSpin()
+		end
+	end)
+end
+
+local function PlayerRemoving(player)
+	local playerData = player:WaitForChild("PlayerData")
+	local spinCountdown = playerData:WaitForChild("SpinCountdown")
+
+	local join = SpinJoinTimes[player.Name]
+	if join then
+		local passed = os.time() - join
+		spinCountdown.Value = math.max(0, spinCountdown.Value - passed)
+		SpinJoinTimes[player.Name] = nil
+	end
+end
+
+local function Rebirth(player)
+	local playerData = player:FindFirstChild("PlayerData")
+	local baseData = player:FindFirstChild("BaseData")
+	local inventoryData = player:FindFirstChild("InventoryData")
+
+	local nextData = Modules.RebirthData[playerData.Rebirths.Value + 1]
+	if not (nextData and playerData and baseData and inventoryData) then return end
+
+	if playerData.Cash.Value < nextData.Cost then
+		Remotes.Notify:FireClient(player, "Not enough cash!", Color3.fromRGB(255,0,0), Color3.fromRGB(155,25,0), ReplicatedStorage.Assets.Sounds.error)
+		return
+	end
+
+	playerData.Cash.Value = 0
+	playerData.Gems.Value += nextData.Gem
+	playerData.CashMulti.Value += nextData.CashMulti
+	playerData.Spins.Value += nextData.Spins
+	baseData.Slots.Value += nextData.Slots
+	baseData.Floors.Value += nextData.Floors
+	playerData.Rebirths.Value += 1
+
+	Remotes.Notify:FireClient(player, "Successfully Rebirthed!", Color3.fromRGB(0,255,0), Color3.fromRGB(0,200,0), ReplicatedStorage.Assets.Sounds.correct)
+
+	if inventoryData.Other:FindFirstChild(nextData.Key) then
+		inventoryData.Other[nextData.Key].Value += 1
+	end
+
+	for _, crate in nextData.Crates do
+		local c = inventoryData.Crates:FindFirstChild(crate)
+		if c then
+			c.Value += 1
+		end
+	end
+end
+
+local function SpinWheel(player)
+	local profile = getProfile(player)
+	if not profile then return end
+
+	local playerData = player:FindFirstChild("PlayerData")
+	local inventoryData = player:FindFirstChild("InventoryData")
+	local spins = playerData and playerData:FindFirstChild("Spins")
+	if not (playerData and inventoryData and spins) then return end
+
+	if spins.Value <= 0 then return end
+
+	local chances = {}
+	for name, v in Modules.SpinData do
+		chances[name] = v.Chance
+	end
+
+	local reward = tostring(Modules.Randomize.Randomize(chances))
+	if not Modules.SpinData[reward] then return end
+
+	spins.Value -= 1
+
+	task.delay(3, function()
+		local data = Modules.SpinData[reward]
+
+		if reward:find("Cash") then
+			playerData.Cash.Value += data.Reward
+
+		elseif reward:find("Gems") then
+			playerData.Gems.Value += data.Reward
+
+		elseif reward:find("Crate") then
+			local c = inventoryData.Crates:FindFirstChild(reward)
+			if c then c.Value += data.Reward end
+
+		elseif reward:find("ServerLuck") then
+			local server = ServerScriptService.Server.BrainrotServer
+			server.ServerLuck.Value = 2
+			server.ServerLuckTimer.Value = 1200
+			Remotes.Notify:FireAllClients("2x Server Luck Activated!", Color3.fromRGB(0,255,0), Color3.fromRGB(0,200,0), ReplicatedStorage.Assets.Sounds.event)
+
+		elseif reward:find("Sword") then
+			local weapons = inventoryData:WaitForChild("Weapons")
+			if not weapons[reward].Value then
+				weapons[reward].Value = true
+			end
+
+		elseif reward == "StealKey" then
+			local other = inventoryData:WaitForChild("Other")
+			if other:FindFirstChild(reward) then
+				other[reward].Value += data.Reward
+			end
+
+		elseif reward == "FullMetal" then
+			local slot = getFreeSlot(player, profile)
+			if not slot then return end
+
+			local slotData = profile.BrainrotsData[slot]
+			slotData.Owned = true
+			slotData.Name = "FullMetal"
+			slotData.Mutations = {}
+			slotData.OfflineEarnings = 0
+
+			profile.Index[slotData.Name].Normal = true
+
+			local base = Modules.BaseManager:GetBase(player)
+			if base then
+				base:CreateBrainrot(slot, {Name = slotData.Name, Mutations = {}})
+			end
+		end
+	end)
+
+	Events.Spin:FireClient(player, reward)
+end
+
+local function Codes(player, code)
+	if not (player and code) then return end
+
+	local rewards = Modules.CodesData[code]
+	if not rewards or rewards.Expired then return end
+
+	local playerData = player:FindFirstChild("PlayerData")
+	local inventoryData = player:FindFirstChild("InventoryData")
+	local profile = getProfile(player)
+
+	if not (playerData and inventoryData and profile) then return end
+
+	if profile.Redeemed[code] then
+		Remotes.Notify:FireClient(player, "Already claimed!", Color3.fromRGB(255,0,0), Color3.fromRGB(155,25,0), ReplicatedStorage.Assets.Sounds.error)
+		return
+	end
+
+	profile.Redeemed[code] = true
+	Remotes.Notify:FireClient(player, "Successfully Claimed Code!", Color3.fromRGB(0,255,0), Color3.fromRGB(0,200,0), ReplicatedStorage.Assets.Sounds.cash)
+
+	if rewards.Cash then playerData.Cash.Value += rewards.Cash end
+	if rewards.Gems then playerData.Gems.Value += rewards.Gems end
+	if rewards.Spins then playerData.Spins.Value += rewards.Spins end
+
+	if rewards.Key and inventoryData.Other:FindFirstChild(rewards.Key) then
+		inventoryData.Other[rewards.Key].Value += 1
+	end
+
+	for _, crate in rewards.Crates do
+		local c = inventoryData.Crates:FindFirstChild(crate)
+		if c then c.Value += 1 end
+	end
+end
+
+local function DailyStreak(player)
+	if not player then return end
+
+	local playerData = player:FindFirstChild("PlayerData")
+	local inventoryData = player:FindFirstChild("InventoryData")
+	local profile = getProfile(player)
+
+	if not (playerData and inventoryData and profile) then return end
+
+	for day, reward in Modules.DailyData do
+		if profile.Streak >= day and not profile.Claimed[day] then
+			profile.Claimed[day] = true
+
+			if reward.Cash then
+				playerData.Cash.Value += reward.Cash
+			elseif reward.Gems then
+				playerData.Gems.Value += reward.Gems
+			elseif reward.Spins then
+				playerData.Spins.Value += reward.Spins
+			elseif reward.Key then
+				local key = inventoryData.Other:FindFirstChild(reward.Key)
+				if key then key.Value += 1 end
+			elseif reward.Crate then
+				local crate = inventoryData.Crates:FindFirstChild(reward.Crate)
+				if crate then crate.Value += 1 end
+			elseif reward.ServerLuck then
+				local server = ServerScriptService.Server.BrainrotServer
+				server.ServerLuck.Value = 2
+				server.ServerLuckTimer.Value = 1200
+			end
+		end
+	end
+end
+
+local function BattlepassReward(player, level)
+	if not (player and level) then return end
+
+	local profile = getProfile(player)
+	if not profile then return end
+
+	local playerData = player:FindFirstChild("PlayerData")
+	local inventoryData = player:FindFirstChild("InventoryData")
+	local battlepassData = player:FindFirstChild("BattlepassData")
+
+	if not (playerData and inventoryData and battlepassData) then return end
+	if battlepassData.Level.Value < level then return end
+
+	local rewards = Modules.BattlepassData
+	local claimed = profile.BpRewards
+
+	local function giveReward(info, container)
+		if info.ValueName == "Cash" or info.ValueName == "Gems" or info.ValueName == "Spins" then
+			playerData[info.ValueName].Value += info.SetTo
+
+		elseif info.ValueName:find("Crate") then
+			inventoryData.Crates[info.ValueName].Value += info.SetTo
+
+		elseif inventoryData.Other:FindFirstChild(info.ValueName) then
+			local obj = inventoryData.Other[info.ValueName]
+			if typeof(obj.Value) == "boolean" then
+				obj.Value = info.SetTo
+			else
+				obj.Value += info.SetTo
+			end
+
+		elseif CharacterModels[info.ValueName] then
+			for _ = 1, info.SetTo do
+				local slot = getFreeSlot(player, profile)
+				if not slot then
+					container[tostring(level)] = false
+					return
+				end
+
+				local slotData = profile.BrainrotsData[slot]
+				slotData.Owned = true
+				slotData.Name = info.ValueName
+				slotData.Mutations = {}
+				slotData.OfflineEarnings = 0
+
+				profile.Index[slotData.Name].Normal = true
+
+				local base = Modules.BaseManager:GetBase(player)
+				if base then
+					base:CreateBrainrot(slot, {Name = slotData.Name, Mutations = {}})
+				end
+			end
+		end
+	end
+
+	if not claimed.Normal[tostring(level)] then
+		claimed.Normal[tostring(level)] = true
+		giveReward(rewards.NormalRewards[level].Reward, claimed.Normal)
+	else
+		Remotes.Notify:FireClient(player, "Already claimed!", Color3.fromRGB(255,0,0), Color3.fromRGB(155,25,0), ReplicatedStorage.Assets.Sounds.error)
+	end
+
+	if claimed.Premium[tostring(level)] == nil and player.GamepassesOwned["Battlepass Premium"].Value then
+		claimed.Premium[tostring(level)] = true
+		giveReward(rewards.PremiumRewards[level].Reward, claimed.Premium)
+	end
+end
+
+local function PurchaseItem(player, itemName)
+	if not (player and itemName) then return end
+
+	local character = player.Character
+	if not character then return end
+
+	local playerData = player:FindFirstChild("PlayerData")
+	local inventoryData = player:FindFirstChild("InventoryData")
+	if not (playerData and inventoryData) then return end
+
+	local item = Modules.ItemShopData[itemName]
+	if not item then return end
+
+	if playerData.Cash.Value < item.Cost then
+		Remotes.Notify:FireClient(player, "Not enough cash!", Color3.fromRGB(255,0,0), Color3.fromRGB(155,25,0), ReplicatedStorage.Assets.Sounds.error)
+		return
+	end
+
+	if item.Item then
+		if player.Backpack:FindFirstChild(item.Item.Name) or character:FindFirstChild(item.Item.Name) then
+			Remotes.Notify:FireClient(player, "You already have this!", Color3.fromRGB(255,0,0), Color3.fromRGB(155,25,0), ReplicatedStorage.Assets.Sounds.error)
+			return
+		end
+
+		item.Item:Clone().Parent = player.Backpack
+		playerData.Cash.Value -= item.Cost
+
+	elseif item.InventoryBool then
+		local container = inventoryData.Weapons:FindFirstChild(item.InventoryBool)
+			or inventoryData.Utility:FindFirstChild(item.InventoryBool)
+
+		if not container then return end
+
+		if container.Value then
+			Remotes.Notify:FireClient(player, "You already have this!", Color3.fromRGB(255,0,0), Color3.fromRGB(155,25,0), ReplicatedStorage.Assets.Sounds.error)
+			return
+		end
+
+		container.Value = true
+		playerData.Cash.Value -= item.Cost
+	end
+
+	Remotes.Notify:FireClient(player, "Purchase successful!", Color3.fromRGB(0,255,0), Color3.fromRGB(0,200,0), ReplicatedStorage.Assets.Sounds.cash)
+end
+
+local function AutoSell(player, switch, mutation, rank, bool)
+	if not player or not player.GamepassesOwned["Auto Sell"].Value then return end
+
+	local profile = getProfile(player)
+	if not profile then return end
+
+	if typeof(switch) == "boolean" then
+		profile.SettingsData.AutoSell.Enabled = switch
+		return
+	end
+
+	if mutation and rank and bool ~= nil then
+		local settings = profile.SettingsData.AutoSell
+		if settings[mutation] and settings[mutation][rank] ~= nil then
+			settings[mutation][rank] = bool
+		end
+	end
+end
+
+local function OnFavorited(player)
+	if not player then return end
+
+	local profile = getProfile(player)
+	local playerData = player:FindFirstChild("PlayerData")
+
+	if not (profile and playerData) then return end
+	if profile.Favorited or not player:IsInGroupAsync(Modules.Monetization.GroupId) then return end
+
+	local slot = getFreeSlot(player, profile)
+	if not slot then
+		Remotes.Notify:FireClient(player, "Your base is full!", Color3.fromRGB(255,0,0), Color3.fromRGB(155,25,0), ReplicatedStorage.Assets.Sounds.error)
+		return
+	end
+
+	local slotData = profile.BrainrotsData[slot]
+	slotData.Owned = true
+	slotData.Name = "Pickle"
+	slotData.Mutations = {}
+	slotData.OfflineEarnings = 0
+
+	profile.Index[slotData.Name].Normal = true
+
+	local base = Modules.BaseManager:GetBase(player)
+	if base then
+		Remotes.Notify:FireClient(player, "You recieved a 'Pickle'!", Color3.fromRGB(0,255,0), Color3.fromRGB(0,200,0), ReplicatedStorage.Assets.Sounds.cash)
+		base:CreateBrainrot(slot, {Name = slotData.Name, Mutations = {}})
+	end
+
+	profile.Favorited = true
+	playerData.Gems.Value += 100
+
+	Remotes.Notify:FireClient(player, "You successfully got the rewards for favoriting and joining the group!", Color3.fromRGB(0,255,0), Color3.fromRGB(0,200,0), ReplicatedStorage.Assets.Sounds.cash)
+end
+
+for _, p in Players:GetPlayers() do
+	PlayerAdded(p)
+end
+
+game:BindToClose(function()
+	for _, p in Players:GetPlayers() do
+		PlayerRemoving(p)
+	end
+end)
+
+Events.Rebirth.OnServerEvent:Connect(Rebirth)
+Events.Spin.OnServerEvent:Connect(SpinWheel)
+Events.Redeem.OnServerEvent:Connect(Codes)
+Events.Daily.OnServerEvent:Connect(DailyStreak)
+Events.Battlepass.OnServerEvent:Connect(BattlepassReward)
+Events.Shop.OnServerEvent:Connect(PurchaseItem)
+Events.AutoSell.OnServerEvent:Connect(AutoSell)
+Events.Favorite.OnServerEvent:Connect(OnFavorited)
+
+Players.PlayerAdded:Connect(PlayerAdded)
+Players.PlayerRemoving:Connect(PlayerRemoving)
