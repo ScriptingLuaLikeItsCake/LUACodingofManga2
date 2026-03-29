@@ -1,0 +1,87 @@
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+ 
+local DataManager = require(ServerScriptService.ProfileService.MainData.DataManager)
+local Brainrot = require(script.Parent.Brainrots)
+ 
+local Base = {}
+Base.__index = Base
+ 
+function Base.new(player)
+    local self = setmetatable({}, Base)
+    self.Player = player
+    self.Profile = DataManager.getProfileData(player)
+    self.Brainrots = {}
+    self.Connections = {}
+    self:LoadBase()
+    return self
+end
+ 
+ 
+function Base:LoadBase()
+    local baseName = self.Player:GetAttribute("Base")
+    if not baseName then return end
+ 
+    self.Model = Workspace.Server.BaseSystem.Bases[baseName]
+    self.Spawn = Workspace.Server.BaseSystem.SpawnLocations[baseName]
+    self.Slots = self.Model["1stFloor"].Platform
+ 
+    self.BrainrotModels = {}
+    for _, model in ReplicatedStorage.Assets.Models:GetDescendants() do
+        if not model:IsA("Model") then continue end
+        self.BrainrotModels[model.Name] = model
+    end
+ 
+    self:SetupSpawn()
+    self:LoadBrainrots()
+end
+ 
+ 
+function Base:SetupSpawn()
+    self.Connections.CharacterAdded = self.Player.CharacterAdded:Connect(function(char)
+        char:PivotTo(self.Spawn.CFrame)
+    end)
+    
+    self.Player.Character:PivotTo(self.Spawn.CFrame)
+end
+ 
+ 
+function Base:LoadBrainrots()
+    for slotNum, brainrotInfo in self.Profile.BrainrotsData do
+        if brainrotInfo ~= false then
+            self:CreateBrainrot(slotNum, brainrotInfo)
+        end
+    end
+end
+ 
+ 
+function Base:CreateBrainrot(slotNum, brainrotInfo)
+    if self.Brainrots[slotNum] then return end
+ 
+    local brainrot = Brainrot.new(
+        self.Player,
+        self,
+        slotNum,
+        brainrotInfo
+    )
+ 
+    self.Brainrots[slotNum] = brainrot
+end
+ 
+ 
+function Base:GetPrompt(slotNum)
+    return Workspace.Server.BaseSystem.Interactions[self.Model.Name][slotNum].ProximityPrompt
+end
+ 
+ 
+function Base:Destroy()
+    for _, brainrot in self.Brainrots do
+        brainrot:Destroy()
+    end
+    for _, conn in self.Connections do
+        conn:Disconnect()
+    end
+end
+ 
+return Base
